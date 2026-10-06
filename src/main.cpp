@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
+#include <WiFiClient.h>
+
+// For extracting the attacker's IP from the socket
+#include <lwip/sockets.h>
 
 // LibSSH Includes
 #include <libssh_esp32.h>
@@ -13,6 +17,7 @@ enum AppState {
     STATE_SELECTING,
     STATE_AWAITING_PASSWORD,
     STATE_CONNECTING,
+    STATE_AWAITING_TARGET, // New State
     STATE_HONEYPOT
 };
 
@@ -22,7 +27,41 @@ int selectedIndex = 0;
 String selectedSSID = "";
 String inputBuffer = "";
 
+// Logging Server config
+String targetHost = "";
+uint16_t targetPort = 0;
+int globalSessionCount = 0; // Increments every new SSH connection
+
 TaskHandle_t sshTaskHandle = NULL;
+
+// ----------------------------------------------------
+// JSON Escaping & Network Logging
+// ----------------------------------------------------
+String escapeJSON(String input) {
+    input.replace("\\", "\\\\");
+    input.replace("\"", "\\\"");
+    input.replace("\n", "\\n");
+    input.replace("\r", "");
+    return input;
+}
+
+void sendLogToServer(String ip, int session, String command) {
+    WiFiClient client;
+    // Attempt a raw TCP connection to the target
+    if (client.connect(targetHost.c_str(), targetPort)) {
+        String payload = "{\n";
+        payload += "  \"ip\": \"" + ip + "\",\n";
+        payload += "  \"session\": " + String(session) + ",\n";
+        payload += "  \"command\": \"" + escapeJSON(command) + "\"\n";
+        payload += "}\n";
+        
+        client.print(payload);
+        client.stop();
+        Serial.println("[LOG SENT] " + command);
+    } else {
+        Serial.println("\n[!] Failed to send log to " + targetHost + ":" + String(targetPort));
+    }
+}
 
 // ----------------------------------------------------
 // UI Logic (Serial)
@@ -59,10 +98,15 @@ void printState() {
         case STATE_CONNECTING:
             Serial.println("Connecting...");
             break;
+        case STATE_AWAITING_TARGET:
+            Serial.println("Wi-Fi Connected!");
+            Serial.println("Enter logging server IP:PORT (e.g. 192.168.1.50:8080)");
+            break;
         case STATE_HONEYPOT:
             Serial.println("SSH POT ACTIVE");
-            Serial.print("IP: "); 
+            Serial.print("Local IP: "); 
             Serial.println(WiFi.localIP());
+            Serial.println("Logging targets to: " + targetHost + ":" + String(targetPort));
             Serial.println("Awaiting connections...");
             break;
     }
@@ -92,6 +136,19 @@ void sshHoneypotTask(void *pvParameters) {
         // This blocks until a hacker connects
         if (ssh_bind_accept(sshbind, session) == SSH_OK) {
             pushLog("--- NEW TARGET ---");
+            
+            int currentSessionId = ++globalSessionCount;
+            String clientIp = "Unknown";
+            
+            // Extract the attacker's IP address from the socket descriptor
+            int fd = ssh_get_fd(session);
+            if (fd >= 0) {
+                struct sockaddr_in peer_addr;
+                socklen_t peer_len = sizeof(peer_addr);
+                if (getpeername(fd, (struct sockaddr*)&peer_addr, &peer_len) == 0) {
+                    clientIp = inet_ntoa(peer_addr.sin_addr);
+                }
+            }
 
             if (ssh_handle_key_exchange(session) == SSH_OK) {
                 ssh_message message;
@@ -105,8 +162,9 @@ void sshHoneypotTask(void *pvParameters) {
                         String user = ssh_message_auth_user(message);
                         String pass = ssh_message_auth_password(message);
                         
-                        pushLog("U: " + user);
-                        pushLog("P: " + pass);
+                        pushLog("U: " + user + " | P: " + pass);
+                        // Send the attempted login credentials as a command log
+                        sendLogToServer(clientIp, currentSessionId, "LOGIN ATTEMPT - User: " + user + " Pass: " + pass);
                         
                         // Let them in regardless of what they typed!
                         ssh_message_auth_reply_success(message, 0);
@@ -163,6 +221,9 @@ void sshHoneypotTask(void *pvParameters) {
                                     if (cmd.length() > 0) {
                                         pushLog("> " + cmd);
                                         
+                                        // Send the executed command to your log server
+                                        sendLogToServer(clientIp, currentSessionId, cmd);
+                                        
                                         if (cmd == "ls") {
                                             ssh_channel_write(channel, "\r\nbin boot dev etc home lib root sys usr var\r\n", 46);
                                         } else if (cmd == "whoami") {
@@ -209,11 +270,9 @@ void connectToWiFi(String password) {
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(500);
 
     if (WiFi.status() == WL_CONNECTED) {
-        currentState = STATE_HONEYPOT;
+        // Now we wait for the target IP instead of jumping straight to HONEYPOT
+        currentState = STATE_AWAITING_TARGET;
         printState();
-        
-        // Spin up the SSH server in its own RTOS Thread
-        xTaskCreate(sshHoneypotTask, "SSH_Task", 16384, NULL, 1, &sshTaskHandle);
     } else {
         Serial.println("\n[!] Connection failed. Please try again.");
         currentState = STATE_SELECTING;
@@ -227,6 +286,23 @@ void processCommand(String cmd) {
 
     if (currentState == STATE_AWAITING_PASSWORD) {
         connectToWiFi(cmd);
+        return;
+    }
+
+    if (currentState == STATE_AWAITING_TARGET) {
+        int colonIndex = cmd.indexOf(':');
+        if (colonIndex > 0) {
+            targetHost = cmd.substring(0, colonIndex);
+            targetPort = cmd.substring(colonIndex + 1).toInt();
+            
+            currentState = STATE_HONEYPOT;
+            printState();
+            
+            // Spin up the SSH server only after we have the target log server
+            xTaskCreate(sshHoneypotTask, "SSH_Task", 16384, NULL, 1, &sshTaskHandle);
+        } else {
+            Serial.println("\n[!] Invalid format. Please use IP:PORT (e.g. 192.168.1.10:8000)");
+        }
         return;
     }
 
@@ -264,12 +340,11 @@ void processCommand(String cmd) {
 void setup() {
     Serial.begin(115200);
     
-    // Initialize SPIFFS (Required to read the SSH keys)
     if (!SPIFFS.begin(true)) {
         Serial.println("SPIFFS Mount Failed");
     }
 
-    libssh_begin(); // Initialize the underlying libssh engine
+    libssh_begin(); 
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -290,5 +365,4 @@ void loop() {
             inputBuffer += c;
         }
     }
-    // No honeypot logic here! It is all safely running in the RTOS task.
 }
