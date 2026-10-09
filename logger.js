@@ -21,7 +21,8 @@ const server = net.createServer((socket) => {
                 console.log('\n[🚨] NEW HONEYPOT EVENT');
                 console.log(` ├─ Target IP  : ${log.ip}`);
                 console.log(` ├─ Session ID : ${log.session}`);
-                console.log(` └─ Action     : ${log.command}`);
+                console.log(` ├─ Action     : ${log.command}`);
+                console.log(` └─ session_type     : ${log.session_type}`);
                 
             } catch (err) {
                 console.error('\n[!] Failed to parse incoming JSON.');
